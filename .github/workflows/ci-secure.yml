@@ -1,0 +1,181 @@
+stages:
+  - security-setup
+  - build
+  - sast
+  - container-scan
+  - dast
+  - deploy
+  - security-report
+
+variables:
+  SEMGREP_APP_TOKEN: $SEMGREP_TOKEN
+  DOCKER_TLS_CERTDIR: "/certs"
+  SECURE_LOG_LEVEL: "info"
+
+# Security Setup
+security-setup:
+  stage: security-setup
+  image: alpine:latest
+  script:
+    - echo "Initializing security pipeline..."
+    - mkdir -p security-reports
+  artifacts:
+    paths:
+      - security-reports/
+    expire_in: 1 week
+
+# Build Secure Images
+build-secure:
+  stage: build
+  image: docker:latest
+  services:
+    - docker:dind
+  script:
+    - docker build -t secure-todo-backend:$CI_COMMIT_SHA -f infrastructure/Dockerfile.backend.secure .
+    - docker build -t secure-todo-frontend:$CI_COMMIT_SHA -f infrastructure/Dockerfile.frontend.secure .
+    - docker save secure-todo-backend:$CI_COMMIT_SHA > backend-image.tar
+    - docker save secure-todo-frontend:$CI_COMMIT_SHA > frontend-image.tar
+  artifacts:
+    paths:
+      - backend-image.tar
+      - frontend-image.tar
+    expire_in: 1 hour
+
+# SAST - Semgrep with Custom Rules
+semgrep-comprehensive:
+  stage: sast
+  image: returntocorp/semgrep:latest
+  script:
+    - semgrep --config=auto --config=p/owasp-top-ten --config=p/security-audit --json --output=security-reports/semgrep-report.json .
+    - semgrep --config=auto --sarif --output=security-reports/semgrep-report.sarif .
+    - echo "Semgrep scan completed"
+  artifacts:
+    reports:
+      sast: security-reports/semgrep-report.json
+    paths:
+      - security-reports/semgrep-report.*
+    expire_in: 1 week
+  allow_failure: false
+  dependencies:
+    - security-setup
+
+# SAST - Bandit
+bandit-comprehensive:
+  stage: sast
+  image: python:3.9
+  before_script:
+    - pip install bandit[toml]
+  script:
+    - bandit -r backend/ -f json -o security-reports/bandit-report.json -ll
+    - bandit -r backend/ -f txt -o security-reports/bandit-report.txt -ll
+  artifacts:
+    paths:
+      - security-reports/bandit-report.*
+    expire_in: 1 week
+  allow_failure: false
+  dependencies:
+    - security-setup
+
+# Secret Detection - TruffleHog
+trufflehog-scan:
+  stage: sast
+  image: python:3.9
+  before_script:
+    - pip install trufflehog
+  script:
+    - trufflehog filesystem . --json > security-reports/secrets-report.json
+    - trufflehog git file://. --since-commit=HEAD~5 --json > security-reports/git-secrets-report.json
+  artifacts:
+    paths:
+      - security-reports/*secrets-report.json
+    expire_in: 1 week
+  allow_failure: false
+  dependencies:
+    - security-setup
+
+# Container Security Scan - Trivy
+trivy-container-scan:
+  stage: container-scan
+  image: aquasec/trivy:latest
+  script:
+    - docker load < backend-image.tar
+    - docker load < frontend-image.tar
+    - trivy image --format json --output security-reports/trivy-backend-report.json secure-todo-backend:$CI_COMMIT_SHA
+    - trivy image --format json --output security-reports/trivy-frontend-report.json secure-todo-frontend:$CI_COMMIT_SHA
+    - trivy image --format table secure-todo-backend:$CI_COMMIT_SHA
+    - trivy image --format table secure-todo-frontend:$CI_COMMIT_SHA
+  artifacts:
+    paths:
+      - security-reports/trivy-*-report.json
+    expire_in: 1 week
+  dependencies:
+    - build-secure
+    - security-setup
+
+# DAST - OWASP ZAP Comprehensive
+zap-comprehensive-scan:
+  stage: dast
+  image: owasp/zap2docker-stable
+  variables:
+    website: "http://secure-todo-app:3000"
+  services:
+    - name: secure-todo-backend:$CI_COMMIT_SHA
+      alias: backend
+    - name: secure-todo-frontend:$CI_COMMIT_SHA
+      alias: frontend
+  script:
+    - mkdir -p /zap/wrk/security-reports
+    - echo "Starting ZAP scans..."
+    # Baseline scan
+    - /zap/zap-baseline.py -t $website -J security-reports/zap-baseline-report.json -r security-reports/zap-baseline-report.html -x security-reports/zap-baseline-report.xml
+    # API scan
+    - /zap/zap-api-scan.py -t http://backend:5000/api -f openapi -J security-reports/zap-api-report.json -r security-reports/zap-api-report.html
+  artifacts:
+    reports:
+      dast: security-reports/zap-baseline-report.json
+    paths:
+      - security-reports/zap-*-report.*
+    expire_in: 1 week
+  dependencies:
+    - build-secure
+    - security-setup
+
+# Deploy to Security Testing Environment
+deploy-security-test:
+  stage: deploy
+  image: docker:latest
+  services:
+    - docker:dind
+  script:
+    - docker load < backend-image.tar
+    - docker load < frontend-image.tar
+    - docker tag secure-todo-backend:$CI_COMMIT_SHA secure-todo-backend:latest
+    - docker tag secure-todo-frontend:$CI_COMMIT_SHA secure-todo-frontend:latest
+    - docker-compose -f infrastructure/docker-compose.secure.yml up -d
+    - echo "Application deployed for security testing"
+  environment:
+    name: security-testing
+    url: http://secure-todo-app:3000
+  dependencies:
+    - build-secure
+
+# Security Report Consolidation
+security-report:
+  stage: security-report
+  image: python:3.9
+  before_script:
+    - pip install jinja2 pandas requests
+  script:
+    - python security/generate-report.py security-reports/
+    - echo "Security report generated"
+  artifacts:
+    paths:
+      - security-reports/consolidated-security-report.html
+      - security-reports/security-metrics.json
+    expire_in: 1 month
+  dependencies:
+    - semgrep-comprehensive
+    - bandit-comprehensive
+    - trufflehog-scan
+    - trivy-container-scan
+    - zap-comprehensive-scan
